@@ -13,15 +13,19 @@ from PIL import Image
 from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, "../")
+sys.path.insert(0, "./")
 
 from common.option import TrainOptions
-from common.architecture import *
+from common.architecture import WVLUT
 from common.utils import (
     logger_info,
     calculate_psnr,
     calculate_ssim,
     calculate_lpips,
     net_loss,
+    SSIMLoss,
+    color_constancy_loss,
+    fft_loss,
 )
 from script.data import LowLightDataProvider, LowLightBenchmark
 
@@ -30,11 +34,36 @@ torch.backends.cudnn.benchmark = True
 
 # ==================== Helper Functions ====================
 
+class EMA:
+    """Exponential Moving Average of model parameters."""
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {k: v.clone().detach() for k, v in model.state_dict().items()}
+        self.backup = {}
+
+    @torch.no_grad()
+    def update(self):
+        for k, v in self.model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].copy_(self.decay * self.shadow[k] + (1.0 - self.decay) * v)
+
+    def apply_shadow(self):
+        self.backup = {k: v.clone().detach() for k, v in self.model.state_dict().items()}
+        self.model.load_state_dict(self.shadow)
+
+    def restore(self):
+        if self.backup:
+            self.model.load_state_dict(self.backup)
+            self.backup = {}
+
+
 def save_checkpoint(model_G: torch.nn.Module, 
                    opt_G: torch.optim.Optimizer, 
                    opt: TrainOptions, 
                    iteration: int, 
-                   best: bool = False) -> None:
+                   best: bool = False,
+                   suffix: str = "") -> None:
     """Save model and optimizer checkpoints.
     
     Args:
@@ -43,22 +72,28 @@ def save_checkpoint(model_G: torch.nn.Module,
         opt: Training options
         iteration: Current iteration number
         best: Whether this is the best model so far
+        suffix: Optional suffix for checkpoint filename
     """
-    str_best = "_best" if best else ""
+    if best:
+        tag = "_best"
+    elif suffix:
+        tag = f"_{suffix}"
+    else:
+        tag = ""
     
     # Save model
     torch.save(
         model_G, 
-        os.path.join(opt.expDir, f"Model_{iteration:06d}{str_best}.pth")
+        os.path.join(opt.expDir, f"Model_{iteration:06d}{tag}.pth")
     )
     
     # Save optimizer state
     torch.save(
         opt_G, 
-        os.path.join(opt.expDir, f"Opt_{iteration:06d}{str_best}.pth")
+        os.path.join(opt.expDir, f"Opt_{iteration:06d}{tag}.pth")
     )
     
-    logger.info(f"Checkpoint saved {iteration}")
+    logger.info(f"Checkpoint saved {iteration}{tag}")
 
 def validate_model(model_G: torch.nn.Module, 
                   valid: LowLightBenchmark, 
@@ -160,9 +195,17 @@ if __name__ == "__main__":
     logger.info(opt_inst.print_options(opt))
     
     # Initialize model
-    model_G = WVLUT(nf=opt.nf, model_type=opt.model_type).cuda()
+    model_G = WVLUT(
+        nf=opt.nf, 
+        model_type=opt.model_type, 
+        gam_type=getattr(opt, 'gam_type', 'pll_4')
+    ).cuda()
     if opt.gpuNum > 1:
         model_G = torch.nn.DataParallel(model_G, device_ids=list(range(opt.gpuNum)))
+    
+    # Initialize EMA and AMP scaler if enabled
+    ema = EMA(model_G) if getattr(opt, 'use_ema', False) else None
+    scaler = torch.cuda.amp.GradScaler() if getattr(opt, 'use_amp', False) else None
     
     # Setup optimizer
     params_G = list(filter(lambda p: p.requires_grad, model_G.parameters()))
@@ -203,6 +246,9 @@ if __name__ == "__main__":
         opt_G.load_state_dict(torch.load(opt_path).state_dict())
         highest_psnr = validate_model(model_G, valid, opt, opt.startIter)
     
+    # Initialize loss criteria
+    ssim_criterion = SSIMLoss(window_size=11, channel=3).cuda()
+    
     # Training loop
     l_accum = [0.0, 0.0, 0.0]
     dT = rT = 0.0
@@ -221,12 +267,39 @@ if __name__ == "__main__":
         st = time.time()
         opt_G.zero_grad()
         
-        pred = model_G(im)
-        loss_G = F.smooth_l1_loss(pred, lb) + 0.04 * net_loss(pred, lb)
+        if getattr(opt, 'use_amp', False):
+            with torch.cuda.amp.autocast():
+                pred = model_G(im)
+                loss_pixel = F.smooth_l1_loss(pred, lb)
+                loss_perceptual = 0.04 * net_loss(pred, lb)
+                loss_ssim = 0.1 * ssim_criterion(pred, lb)
+                loss_freq = 0.01 * fft_loss(pred, lb)
+                loss_color = 0.05 * color_constancy_loss(pred)
+                loss_G = loss_pixel + loss_perceptual + loss_ssim + loss_freq + loss_color
+            
+            scaler.scale(loss_G).backward()
+            scaler.unscale_(opt_G)
+            torch.nn.utils.clip_grad_norm_(params_G, max_norm=1.0)
+            scaler.step(opt_G)
+            scaler.update()
+        else:
+            pred = model_G(im)
+            
+            # Multi-objective loss function
+            loss_pixel = F.smooth_l1_loss(pred, lb)
+            loss_perceptual = 0.04 * net_loss(pred, lb)
+            loss_ssim = 0.1 * ssim_criterion(pred, lb)
+            loss_freq = 0.01 * fft_loss(pred, lb)
+            loss_color = 0.05 * color_constancy_loss(pred)
+            loss_G = loss_pixel + loss_perceptual + loss_ssim + loss_freq + loss_color
+            
+            loss_G.backward()
+            torch.nn.utils.clip_grad_norm_(params_G, max_norm=1.0)
+            opt_G.step()
         
-        loss_G.backward()
-        opt_G.step()
         scheduler.step()
+        if ema is not None:
+            ema.update()
         
         rT += time.time() - st
         
@@ -246,24 +319,33 @@ if __name__ == "__main__":
         
         # Save checkpoint
         if i % opt.saveStep == 0:
-            if opt.gpuNum > 1:
-                save_checkpoint(model_G.module, opt_G, opt, i)
-            else:
-                save_checkpoint(model_G, opt_G, opt, i)
+            target_model = model_G.module if opt.gpuNum > 1 else model_G
+            save_checkpoint(target_model, opt_G, opt, i)
+            if ema is not None:
+                ema.apply_shadow()
+                save_checkpoint(target_model, opt_G, opt, i, suffix="ema")
+                ema.restore()
         
         # Validation
         if i % opt.valStep == 0:
             logger.info(f"lr = {scheduler.get_last_lr()[0]:.8f}")
+            target_model = model_G.module if opt.gpuNum > 1 else model_G
             
-            if opt.gpuNum > 1:
-                psnr = validate_model(model_G.module, valid, opt, i)
-            else:
-                psnr = validate_model(model_G, valid, opt, i)
-            
+            psnr = validate_model(target_model, valid, opt, i)
             if psnr > highest_psnr:
                 logger.info(f"highest psnr: {psnr:.4f}")
                 highest_psnr = psnr
-                save_checkpoint(model_G, opt_G, opt, i, best=True)
+                save_checkpoint(target_model, opt_G, opt, i, best=True)
+
+            if ema is not None:
+                ema.apply_shadow()
+                psnr_ema = validate_model(target_model, valid, opt, i)
+                logger.info(f"EMA psnr: {psnr_ema:.4f}")
+                if psnr_ema > highest_psnr:
+                    logger.info(f"highest EMA psnr: {psnr_ema:.4f}")
+                    highest_psnr = psnr_ema
+                    save_checkpoint(target_model, opt_G, opt, i, best=True, suffix="best_ema")
+                ema.restore()
         
         # Clear memory
         del im, lb, pred, loss_G

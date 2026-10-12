@@ -7,8 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, "../")  # run under the current directory
-from common.architecture import *
-from common.GAM import GAM_pll_4
+from common.GAM import GAM_pll_2, GAM_pll_4, GAM_pll_8
 
 mode_pad_dict = {"c": 1, "d": 2, "y": 2}
 
@@ -26,7 +25,7 @@ class Finetune(nn.Module):
         freeze_non_lut (bool): Whether to freeze all parameters except LUT weights
     """
 
-    def __init__(self, lut_folder, modes, interval=4, model_path=None, model_type='shared', freeze_non_lut=True):
+    def __init__(self, lut_folder, modes, interval=4, model_path=None, model_type='shared', freeze_non_lut=True, gam_type='pll_4'):
         super(Finetune, self).__init__()
         self.interval = interval
         self.modes = modes
@@ -82,7 +81,13 @@ class Finetune(nn.Module):
         self.register_parameter(name="weight_s3_3d", param=torch.nn.Parameter(torch.Tensor(lut3d_arr)))
 
         # Initialize GAM module
-        self.GAM = GAM_pll_4(in_channels=6)
+        self.gam_type = gam_type
+        if gam_type == 'pll_8':
+            self.GAM = GAM_pll_8(in_channels=6)
+        elif gam_type == 'pll_2':
+            self.GAM = GAM_pll_2(in_channels=6)
+        else:
+            self.GAM = GAM_pll_4(in_channels=6)
 
         # Load pretrained model weights for GAM if provided
         if model_path is not None and os.path.exists(model_path):
@@ -385,8 +390,8 @@ class Finetune(nn.Module):
         p1111 = weight[indices_a2.flatten() * L * L * L + indices_b2.flatten() * L * L + indices_c2.flatten() * L + indices_d2.flatten()
                        ].reshape((indices_a1.shape[0], indices_a1.shape[1], indices_a1.shape[2], indices_a1.shape[3], upscale, upscale))
 
-        return p0000, p0001, p0010, p0011, p0100, p0101, p0110, p0111, \
-               p1000, p1001, p1010, p1011, p1100, p1101, p1110, p1111
+        return (p0000, p0001, p0010, p0011, p0100, p0101, p0110, p0111,
+                p1000, p1001, p1010, p1011, p1100, p1101, p1110, p1111)
 
     def _perform_interpolation(self, corners, frac_a, frac_b, frac_c, frac_d, q, sz):
         """Perform 4D interpolation using corner values and fractional parts.
@@ -400,8 +405,8 @@ class Finetune(nn.Module):
         Returns:
             Interpolated output tensor
         """
-        p0000, p0001, p0010, p0011, p0100, p0101, p0110, p0111, \
-        p1000, p1001, p1010, p1011, p1100, p1101, p1110, p1111 = corners
+        (p0000, p0001, p0010, p0011, p0100, p0101, p0110, p0111,
+         p1000, p1001, p1010, p1011, p1100, p1101, p1110, p1111) = corners
 
         # Reshape all tensors for interpolation
         out = torch.zeros(sz, 1, dtype=p0000.dtype, device=p0000.device)
@@ -607,14 +612,35 @@ class Finetune(nn.Module):
         weight = self.round_func(weight)
         weight = torch.clamp(weight, -127, 127)
 
+    def round_func(self, input):
+        """Backward Pass Differentiable Approximation (BPDA)."""
+        forward_value = torch.round(input)
+        out = input.clone()
+        out.data = forward_value.data
+        return out
+
+    def apply_color(self, image, ccm):
+        """Apply color correction matrix to the image."""
+        shape = image.shape
+        image = image.view(-1, 3)
+        image = torch.tensordot(image, ccm, dims=[[-1], [-1]])
+        image = image.view(shape)
+        return torch.clamp(image, 1e-8, 1.0)
+
+    def InterpTorchBatch(self, weight, mode, img_in, pad, channel=None):
+        """Perform 4D LUT interpolation on image batch."""
+        # Get dimensions
+        b, c, h, w = img_in.shape
+        upscale = 1
+
         # Calculate quantization parameters
         interval = self.interval
         q = 2 ** interval
         L = 2 ** (8 - interval) + 1
 
         # Get sampling indices and fractional parts
-        indices_a1, indices_b1, indices_c1, indices_d1, \
-        frac_a, frac_b, frac_c, frac_d = self._get_sampling_indices(img_in, mode, h, w, q)
+        (indices_a1, indices_b1, indices_c1, indices_d1,
+         frac_a, frac_b, frac_c, frac_d) = self._get_sampling_indices(img_in, mode, h, w, q)
 
         # Get LUT corner values
         corners = self._get_lut_corners(weight, indices_a1, indices_b1, indices_c1, indices_d1, L, upscale)
@@ -662,9 +688,10 @@ class Finetune(nn.Module):
                     pad = mode_pad_dict[mode]
                     key = "s{}_{}".format(str(stage), mode)
                     weight = getattr(self, "weight_" + key)
+                    scale = self.scale_s1[mode] if stage == 1 else self.scale_s2[mode]
                     for r in [0, 1, 2, 3]:
                         stage_pred += torch.rot90(self.InterpTorchBatch(weight, mode, F.pad(torch.rot90(input_255, r, [
-                            2, 3]), (0, pad, 0, pad), mode='replicate'), pad), (4 - r) % 4, [2, 3]) * 127 * self.scale_s1[mode]
+                            2, 3]), (0, pad, 0, pad), mode='replicate'), pad), (4 - r) % 4, [2, 3]) * 127 * scale
                         stage_pred = self.round_func(stage_pred)
                 input_255 = self.round_func(torch.clamp((stage_pred / avg_factor) + bias, 0, 255))
             
@@ -680,6 +707,7 @@ class Finetune(nn.Module):
                         pad = mode_pad_dict[mode]
                         key = "s{}_{}_{}".format(str(stage), mode, c)
                         weight = getattr(self, "weight_" + key)
+                        scale = self.scale_s1[mode] if stage == 1 else self.scale_s2[mode]
                         
                         for r in [0, 1, 2, 3]:
                             pred_channel += torch.rot90(
@@ -692,7 +720,7 @@ class Finetune(nn.Module):
                                 ), 
                                 (4 - r) % 4, 
                                 [2, 3]
-                            ) * 127 * self.scale_s1[mode]
+                            ) * 127 * scale
                             pred_channel = self.round_func(pred_channel)
                     
                     # Scale and save channel

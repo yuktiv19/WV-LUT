@@ -1,24 +1,16 @@
 import os
 import sys
-import time
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 from PIL import Image
 
 sys.path.insert(0, "../")
+sys.path.insert(0, "./")
 
-from common.architecture import *
+from common.architecture import WVLUT
 from common.finetune import Finetune
 from common.option import TestOptions
-from common.utils import (
-    logger_info,
-    calculate_ssim,
-    net_loss,
-)
 from script.data import LowLightBenchmark
 
 from skimage.metrics import structural_similarity as ssim
@@ -99,15 +91,10 @@ def valid_steps(model_G, valid, datasets, result_path, ifsave=False, ifGT=False)
                 ).cuda()
 
                 if ifGT:
-
-                # pred = model_G(im) * 255.0
-                # t1 = time.time()
-                    pred = model_G(im) 
-                    # t2 = time.time()
-                    # print(t2-t1)
-                    mean_out = pred.reshape(pred.shape[0],-1).mean(dim=1)
-                    mean_gt = cv2.cvtColor(lb.astype(np.float32), cv2.COLOR_BGR2GRAY).mean()/255
-                    pred = torch.clamp(pred*(mean_gt/mean_out), 0, 1) * 255.0
+                    pred = model_G(im)
+                    mean_out = pred.reshape(pred.shape[0], -1).mean(dim=1)
+                    mean_gt = cv2.cvtColor(lb.astype(np.float32), cv2.COLOR_BGR2GRAY).mean() / 255.0
+                    pred = torch.clamp(pred * (mean_gt / mean_out), 0, 1) * 255.0
                 else:
                     pred = model_G(im) * 255.0
 
@@ -159,7 +146,7 @@ def valid_steps(model_G, valid, datasets, result_path, ifsave=False, ifGT=False)
                     np.mean(np.asarray(lpipss)),
                 )
             )
-            return np.mean(np.asarray(psnrs))
+        return np.mean(np.asarray(psnrs))
 
 
 if __name__ == "__main__":
@@ -178,19 +165,24 @@ if __name__ == "__main__":
     
     iter_num = opt.loadIter if hasattr(opt, 'loadIter') else 150000
     
+    gam_type = getattr(opt, 'gam_type', 'pll_4')
+    interval = getattr(opt, 'interval', 4)
+    modes = [i for i in getattr(opt, 'modes', 'cdy')]
+
     if opt.model == "WVLUT":
-        model_G = WVLUT(nf=opt.nf, model_type=opt.model_type).cuda()
+        model_G = WVLUT(nf=opt.nf, model_type=opt.model_type, gam_type=gam_type).cuda()
     elif opt.model == "LUT":
         model_G = Finetune(
             lut_folder=os.path.join(expDir, "luts"),
-            modes=["c", "d", "y"],
-            interval=4,
+            modes=modes,
+            interval=interval,
             model_path=None,
             model_type=opt.model_type,
-            freeze_non_lut=True
+            freeze_non_lut=True,
+            gam_type=gam_type
         ).cuda()
     else:
-        model_G = WVLUT(nf=opt.nf, model_type='shared').cuda()
+        model_G = WVLUT(nf=opt.nf, model_type='shared', gam_type=gam_type).cuda()
     
     lm = torch.load(os.path.join(expDir, f"Model_{iter_num:06d}.pth"))
     model_G.load_state_dict(lm.state_dict(), strict=True)

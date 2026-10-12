@@ -4,8 +4,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, "../")  # run under the current directory
+sys.path.insert(0, "./")
 from common.option import TestOptions
-from common.architecture import *
+from common.architecture import WVLUT
 
 
 def get_input_tensor(opt, dim=4):
@@ -206,7 +207,11 @@ def main():
     opt = TestOptions().parse()
     os.makedirs(os.path.join(opt.expDir, "luts"), exist_ok=True)
 
-    model_wo_shared = WVLUT(nf=opt.nf, model_type=opt.model_type).cuda()
+    model_wo_shared = WVLUT(
+        nf=opt.nf, 
+        model_type=opt.model_type,
+        gam_type=getattr(opt, 'gam_type', 'pll_4')
+    ).cuda()
     lm_wo_shared = torch.load(os.path.join(opt.expDir, f'Model_{opt.loadIter:06d}.pth'))
     model_wo_shared.load_state_dict(lm_wo_shared.state_dict(), strict=True)
     process_model(model_wo_shared, opt, model_type=opt.model_type)

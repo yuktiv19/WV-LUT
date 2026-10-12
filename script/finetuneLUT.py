@@ -13,6 +13,7 @@ from PIL import Image
 from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, "../")
+sys.path.insert(0, "./")
 
 from common.option import TrainOptions
 from common.finetune import Finetune
@@ -22,6 +23,9 @@ from common.utils import (
     calculate_ssim,
     calculate_lpips,
     net_loss,
+    SSIMLoss,
+    color_constancy_loss,
+    fft_loss,
 )
 from script.data import LowLightDataProvider, LowLightBenchmark
 
@@ -196,10 +200,11 @@ if __name__ == "__main__":
     # Initialize Finetune model with lookup tables
     model_G = Finetune(
         lut_folder=lut_folder,
-        modes=["c", "d", "y"],  # Standard modes for low-light enhancement
-        interval=4,  # Default interval for lookup tables
+        modes=[i for i in opt.modes],
+        interval=getattr(opt, 'interval', 4),
         model_path=opt.modelPath if hasattr(opt, 'modelPath') and opt.modelPath is not None else None,
-        model_type=opt.model_type  # 'shared' or 'wo_shared' architecture
+        model_type=opt.model_type,
+        gam_type=getattr(opt, 'gam_type', 'pll_4')
     ).cuda()
 
     # Log parameter count and names if in debug mode
@@ -325,6 +330,9 @@ if __name__ == "__main__":
         highest_psnr = validate_model(model_G, valid, opt, opt.startIter)
         logger.info(f"Loaded checkpoint with PSNR: {highest_psnr:.4f}")
 
+    # Initialize loss criteria
+    ssim_criterion = SSIMLoss(window_size=11, channel=3).cuda()
+
     # Training loop
     l_accum = [0.0, 0.0, 0.0]
     dT = rT = 0.0
@@ -344,9 +352,17 @@ if __name__ == "__main__":
         opt_G.zero_grad()
 
         pred = model_G(im)
-        loss_G = F.smooth_l1_loss(pred, lb) + 0.04 * net_loss(pred, lb)
+        
+        # Multi-objective loss function
+        loss_pixel = F.smooth_l1_loss(pred, lb)
+        loss_perceptual = 0.04 * net_loss(pred, lb)
+        loss_ssim = 0.1 * ssim_criterion(pred, lb)
+        loss_freq = 0.01 * fft_loss(pred, lb)
+        loss_color = 0.05 * color_constancy_loss(pred)
+        loss_G = loss_pixel + loss_perceptual + loss_ssim + loss_freq + loss_color
 
         loss_G.backward()
+        torch.nn.utils.clip_grad_norm_(params_G, max_norm=1.0)
         opt_G.step()
         scheduler.step()  # Keep scheduler step after optimizer step
 

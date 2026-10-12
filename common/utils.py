@@ -3,6 +3,7 @@ import cv2
 import lpips
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from scipy import signal
 from torchvision.models import vgg16
@@ -61,13 +62,69 @@ def net_loss(pred, target):
     pred_norm = (pred - mean) / std
     target_norm = (target - mean) / std
 
-    # Extract features
+    # Extract features — pred must have gradients, target does not
+    pred_features = net_loss.vgg_model(pred_norm)
     with torch.no_grad():
-        pred_features = net_loss.vgg_model(pred_norm)
         target_features = net_loss.vgg_model(target_norm)
 
     # Calculate MSE loss between features
     return F.mse_loss(pred_features, target_features)
+
+
+class SSIMLoss(nn.Module):
+    """Differentiable SSIM loss for training.
+    
+    Returns 1 - SSIM so that minimizing this loss maximizes SSIM.
+    """
+
+    def __init__(self, window_size=11, channel=3):
+        super(SSIMLoss, self).__init__()
+        self.window_size = window_size
+        self.channel = channel
+        self.window = self._create_window(window_size, channel)
+
+    def _create_window(self, window_size, channel):
+        _1d = torch.hann_window(window_size, periodic=False)
+        _2d = _1d.unsqueeze(1) * _1d.unsqueeze(0)
+        _2d = _2d.float().unsqueeze(0).unsqueeze(0)
+        _2d = _2d / _2d.sum()
+        return _2d.expand(channel, 1, window_size, window_size).contiguous()
+
+    def forward(self, pred, target):
+        window = self.window.to(pred.device)
+        pad = self.window_size // 2
+        mu1 = F.conv2d(pred, window, padding=pad, groups=self.channel)
+        mu2 = F.conv2d(target, window, padding=pad, groups=self.channel)
+        mu1_sq, mu2_sq = mu1 ** 2, mu2 ** 2
+        mu1_mu2 = mu1 * mu2
+        sigma1_sq = F.conv2d(pred * pred, window, padding=pad, groups=self.channel) - mu1_sq
+        sigma2_sq = F.conv2d(target * target, window, padding=pad, groups=self.channel) - mu2_sq
+        sigma12 = F.conv2d(pred * target, window, padding=pad, groups=self.channel) - mu1_mu2
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+        return 1 - ssim_map.mean()
+
+
+def color_constancy_loss(pred):
+    """Penalize deviation between mean R, G, B to prevent color casts.
+    
+    Encourages the mean of each channel to be similar, reducing
+    unrealistic color shifts in the enhanced output.
+    """
+    mean_rgb = pred.mean(dim=[2, 3])  # B×3
+    mr, mg, mb = mean_rgb[:, 0], mean_rgb[:, 1], mean_rgb[:, 2]
+    return ((mr - mg) ** 2 + (mr - mb) ** 2 + (mg - mb) ** 2).mean()
+
+
+def fft_loss(pred, target):
+    """Frequency-domain L1 loss for better sharpness and texture preservation.
+    
+    Compares the magnitude spectrum of predicted and target images.
+    """
+    pred_fft = torch.fft.rfft2(pred, norm='ortho')
+    target_fft = torch.fft.rfft2(target, norm='ortho')
+    return F.l1_loss(torch.abs(pred_fft), torch.abs(target_fft))
 
 
 def calculate_lpips(img1, img2):

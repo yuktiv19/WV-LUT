@@ -142,6 +142,32 @@ class LowLightDataset(Dataset):
             high_light = np.rot90(high_light, k)
             low_light = np.rot90(low_light, k)
 
+            # Random brightness jitter on low-light input (simulates varied darkness)
+            if random.random() < 0.3:
+                jitter_factor = random.uniform(0.8, 1.2)
+                low_light = np.clip(low_light.astype(np.float32) * jitter_factor, 0, 255).astype(np.uint8)
+
+            # Paired channel shuffle (color diversity)
+            if random.random() < 0.2:
+                perm = np.random.permutation(3)
+                high_light = high_light[:, :, perm]
+                low_light = low_light[:, :, perm]
+
+            # Paired MixUp augmentation
+            if random.random() < 0.2 and len(self.file_list) > 1:
+                filename2 = random.choice(self.file_list)
+                hl2 = self.high_light_images[filename2]
+                ll2 = self.low_light_images[filename2]
+                h2, w2, _ = hl2.shape
+                if h2 >= self.patch_size and w2 >= self.patch_size:
+                    i2 = random.randint(0, h2 - self.patch_size)
+                    j2 = random.randint(0, w2 - self.patch_size)
+                    hl2 = hl2[i2:i2 + self.patch_size, j2:j2 + self.patch_size, :]
+                    ll2 = ll2[i2:i2 + self.patch_size, j2:j2 + self.patch_size, :]
+                    lam = random.uniform(0.6, 0.95)
+                    high_light = np.clip(lam * high_light.astype(np.float32) + (1.0 - lam) * hl2.astype(np.float32), 0, 255).astype(np.uint8)
+                    low_light = np.clip(lam * low_light.astype(np.float32) + (1.0 - lam) * ll2.astype(np.float32), 0, 255).astype(np.uint8)
+
         # Normalize and convert to tensor format (C, H, W)
         high_light = np.transpose(high_light.astype(np.float32) / 255.0, [2, 0, 1])
         low_light = np.transpose(low_light.astype(np.float32) / 255.0, [2, 0, 1])

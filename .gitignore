@@ -22,6 +22,7 @@ wheels/
 
 # Virtual Environment
 venv/
+.venv/
 env/
 ENV/
 .env
@@ -35,5 +36,28 @@ ENV/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# Datasets (do not track images or datasets)
+data/*
+!data/init
+!data/.gitkeep
+
+# Checkpoints, LUTs & Weights
+*.pth
+*.pt
+*.npy
+models/*
+!models/init
+!models/.gitkeep
+
+# Evaluation Results & Logs
+eval/results/
+eval/test/
+eval/*
+!eval/init
+!eval/.gitkeep
+*.log
+runs/
+events.out.tfevents.*
 
 

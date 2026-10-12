@@ -218,11 +218,12 @@ class WVLUT(nn.Module):
         dense (bool): Whether to use dense connections
     """
 
-    def __init__(self, model_type='shared', nf=64, dense=True):
+    def __init__(self, model_type='shared', nf=64, dense=True, gam_type='pll_4'):
         super(WVLUT, self).__init__()
         self.nf = nf
         self.dense = dense
         self.model_type = model_type
+        self.gam_type = gam_type
 
         # Stage 1
         if model_type == 'shared':
@@ -266,7 +267,12 @@ class WVLUT(nn.Module):
 
         # Stage 3
         self.stage3 = LUTcBlock(nf=nf)
-        self.GAM = GAM_pll_4(in_channels=6)
+        if gam_type == 'pll_8':
+            self.GAM = GAM_pll_8(in_channels=6)
+        elif gam_type == 'pll_2':
+            self.GAM = GAM_pll_2(in_channels=6)
+        else:
+            self.GAM = GAM_pll_4(in_channels=6)
 
     def apply_color(self, image, ccm):
         """Apply color correction matrix to the image."""

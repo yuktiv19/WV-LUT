@@ -40,6 +40,8 @@ class BaseOptions:
                           help='Sampling modes to use in every stage')
         parser.add_argument('--interval', type=int, default=4,
                           help='N bit uniform sampling')
+        parser.add_argument('--gam_type', type=str, default='pll_4', choices=['pll_2', 'pll_4', 'pll_8'],
+                          help='GAM attention module variant (pll_4 standard, pll_8 for enhanced attention)')
         
         # Path configuration
         parser.add_argument('--modelRoot', type=str, default='../models',
@@ -242,11 +244,15 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--weightDecay', type=float, default=0,
                           help='Weight decay')
         
-        # Hardware configuration
+        # Hardware and training optimization configuration
         parser.add_argument('--gpuNum', '-g', type=int, default=1,
                           help='Number of GPUs to use')
         parser.add_argument('--workerNum', '-n', type=int, default=8,
                           help='Number of workers for data loading')
+        parser.add_argument('--use_ema', action='store_true', default=False,
+                          help='Track exponential moving average of model weights')
+        parser.add_argument('--use_amp', action='store_true', default=False,
+                          help='Enable automatic mixed precision (AMP) training')
 
         self.isTrain = True
         return parser
