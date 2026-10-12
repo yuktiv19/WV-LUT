@@ -744,6 +744,8 @@ class Finetune(nn.Module):
         # Apply GAM for color correction
         original_input = x / 255.0  # Original input normalized to [0,1]
         gamma, color = self.GAM(torch.cat([original_input, stage2_output], dim=1))
+        gamma = torch.clamp(gamma, min=1e-2, max=5.0)
+        stage3_output = torch.clamp(stage3_output, min=1e-4, max=1.0)
 
         # Apply color correction
         b = stage3_output.shape[0]

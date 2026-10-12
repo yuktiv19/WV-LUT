@@ -5,7 +5,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy import signal
 from torchvision.models import vgg16
 
 # ============== Loss Functions ==============
@@ -117,14 +116,16 @@ def color_constancy_loss(pred):
     return ((mr - mg) ** 2 + (mr - mb) ** 2 + (mg - mb) ** 2).mean()
 
 
-def fft_loss(pred, target):
+def fft_loss(pred, target, eps=1e-8):
     """Frequency-domain L1 loss for better sharpness and texture preservation.
     
-    Compares the magnitude spectrum of predicted and target images.
+    Compares the magnitude spectrum of predicted and target images with epsilon guard.
     """
     pred_fft = torch.fft.rfft2(pred, norm='ortho')
     target_fft = torch.fft.rfft2(target, norm='ortho')
-    return F.l1_loss(torch.abs(pred_fft), torch.abs(target_fft))
+    pred_mag = torch.sqrt(pred_fft.real ** 2 + pred_fft.imag ** 2 + eps)
+    target_mag = torch.sqrt(target_fft.real ** 2 + target_fft.imag ** 2 + eps)
+    return F.l1_loss(pred_mag, target_mag)
 
 
 def calculate_lpips(img1, img2):

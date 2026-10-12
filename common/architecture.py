@@ -331,8 +331,10 @@ class WVLUT(nn.Module):
         s3_pred = round_func(torch.clamp(s3_pred + 127, 0, 255))
         s3_pred = s3_pred / 255.0
         
-        # Apply color correction
+        # Apply color correction (with numerical stability guards against NaN)
         gamma, color = self.GAM(torch.cat([x, s2_pred], dim=1))
+        gamma = torch.clamp(gamma, min=1e-2, max=5.0)
+        s3_pred = torch.clamp(s3_pred, min=1e-4, max=1.0)
         b = s3_pred.shape[0]
         s3_pred = s3_pred.permute(0, 2, 3, 1)  # (B,C,H,W) -> (B,H,W,C)
         s3_pred = torch.stack(

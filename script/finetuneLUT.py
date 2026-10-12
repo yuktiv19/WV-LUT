@@ -3,7 +3,6 @@ import math
 import os
 import sys
 import time
-from typing import Tuple, List
 
 import numpy as np
 import torch
@@ -360,6 +359,11 @@ if __name__ == "__main__":
         loss_freq = 0.01 * fft_loss(pred, lb)
         loss_color = 0.05 * color_constancy_loss(pred)
         loss_G = loss_pixel + loss_perceptual + loss_ssim + loss_freq + loss_color
+
+        if torch.isnan(loss_G) or torch.isinf(loss_G):
+            logger.warning(f"NaN/Inf loss detected at iteration {i}! Skipping step.")
+            opt_G.zero_grad()
+            continue
 
         loss_G.backward()
         torch.nn.utils.clip_grad_norm_(params_G, max_norm=1.0)

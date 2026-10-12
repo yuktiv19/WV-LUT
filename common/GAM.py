@@ -6,7 +6,7 @@ Reference: https://github.com/cuiziteng/Illumination-Adaptive-Transformer
 import torch
 import torch.nn as nn
 from timm.models.layers import trunc_normal_, DropPath
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 
 class Mlp(nn.Module):
