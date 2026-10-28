@@ -589,48 +589,14 @@ class Finetune(nn.Module):
         
         return out
 
-    def InterpTorchBatch(self, weight, mode, img_in, bd, upscale=1):
-        """4D lookup table interpolation for stages 1 and 2.
-        
-        Args:
-            weight: 4D lookup table weights
-            mode: Interpolation mode ('c', 'd', or 'y')
-            img_in: Input image tensor
-            bd: Border size
-            upscale: Upscaling factor
-            
-        Returns:
-            Interpolated output tensor
-        """
-        # Get dimensions
-        _, _, h, w = img_in.shape
-        h -= bd
-        w -= bd
-
-        # Scale and clamp weights
-        weight = weight * 127
-        weight = self.round_func(weight)
-        weight = torch.clamp(weight, -127, 127)
-
-    def round_func(self, input):
-        """Backward Pass Differentiable Approximation (BPDA)."""
-        forward_value = torch.round(input)
-        out = input.clone()
-        out.data = forward_value.data
-        return out
-
-    def apply_color(self, image, ccm):
-        """Apply color correction matrix to the image."""
-        shape = image.shape
-        image = image.view(-1, 3)
-        image = torch.tensordot(image, ccm, dims=[[-1], [-1]])
-        image = image.view(shape)
-        return torch.clamp(image, 1e-8, 1.0)
-
     def InterpTorchBatch(self, weight, mode, img_in, pad, channel=None):
         """Perform 4D LUT interpolation on image batch."""
+        if channel is not None:
+            img_in = img_in[:, channel:channel + 1, :, :]
         # Get dimensions
-        b, c, h, w = img_in.shape
+        b, c, h_pad, w_pad = img_in.shape
+        h = h_pad - pad
+        w = w_pad - pad
         upscale = 1
 
         # Calculate quantization parameters
@@ -737,12 +703,12 @@ class Finetune(nn.Module):
         # Process stage 3 with 3D LUT
         weight_3d = getattr(self, "weight_s3_3d")
         stage3_output = self.InterpTorch3DBatch(weight_3d, stage2_output * 255.0)
-        stage3_output = self.round_func(stage3_output * 255.0)
+        stage3_output = self.round_func(stage3_output + 127)
         stage3_output = self.round_func(torch.clamp(stage3_output, 0, 255))
         stage3_output = stage3_output / 255.0
 
         # Apply GAM for color correction
-        original_input = x / 255.0  # Original input normalized to [0,1]
+        original_input = x  # Input is already normalized to [0, 1]
         gamma, color = self.GAM(torch.cat([original_input, stage2_output], dim=1))
         gamma = torch.clamp(gamma, min=1e-2, max=5.0)
         stage3_output = torch.clamp(stage3_output, min=1e-4, max=1.0)
