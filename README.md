@@ -172,8 +172,8 @@ python eval.py \
 If you use our fixes or results, please cite our paper:
 
 ```bibtex
-@misc{varshney2026reproducing,
-  author = {Varshney, Yukti and Takhi, Harkirat Singh},
+@misc{reproducing wvlut,
+  author = {Yukti Varshney and Harkirat Singh Takhi},
   title  = {Reproducing {WV-LUT}: A Perceptual-Loss Fix, a Multi-Domain Objective, and
             Synchronization-Free {LUT} Fine-Tuning for Real-Time Low-Light Image Enhancement},
   year   = {2026},
