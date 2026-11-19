@@ -1,116 +1,45 @@
-# WV-LUT: Wide Vision Lookup Tables for Real-Time Low-Light Image Enhancement
+# Reproducing WV-LUT: A Perceptual-Loss Fix, a Multi-Domain Objective, and Synchronization-Free LUT Fine-Tuning
 
-> **Extended & Improved Implementation** based on the paper:
-> [*"WV-LUT: Wide Vision Lookup Tables for Real-Time Low-Light Image Enhancement"*](https://doi.org/10.1109/TMM.2025.3535342) — IEEE Transactions on Multimedia, 2025.
+Code for our reproduction study of
+[WV-LUT: Wide Vision Lookup Tables for Real-Time Low-Light Image Enhancement](https://doi.org/10.1109/TMM.2025.3535342)
+(Li *et al.*, IEEE Transactions on Multimedia, 2025).
 
-This repository contains an **enhanced reproduction** of WV-LUT with five targeted improvements to the training pipeline, loss formulation, architecture, and inference efficiency. Our improved model **surpasses the paper's reported NN baseline PSNR** on the LOL-v1 benchmark using **only 1/3 of the original training iterations**.
+**Authors:** Yukti Varshney, Harkirat Singh Takhi
+Department of Computer Science and Engineering, Netaji Subhas University of Technology, New Delhi
 
----
-
-## Results at a Glance (LOL-v1 Benchmark)
-
-| Model | Checkpoint | PSNR (dB) ↑ | SSIM ↑ | LPIPS ↓ | Iters |
-|---|---|:---:|:---:|:---:|:---:|
-| **Paper Baseline — NN** | 150,000 | 22.80 | 0.835 | 0.170 | 150k |
-| **Paper Baseline — LUT** | 160,000 | 22.50 | 0.830 | 0.170 | +10k FT |
-| **Ours — NN** | 50,000 | **23.06** | **0.820** | **0.182** | **50k** |
-| **Ours — LUT** | 60,000 | **22.06** | **0.779** | **0.258** | +10k FT |
-
-**Key result:** Our NN model achieves **+0.26 dB PSNR** over the paper's NN baseline while converging in **3× fewer training iterations**.
+> This repository is built on the
+> [official WV-LUT implementation](https://github.com/ssw219/WV-LUT) by Canlin Li, Haowen Su, Xin Tan,
+> Xiangfei Zhang and Lizhuang Ma. The model architecture, data pipeline and evaluation code are theirs.
+> Our changes are listed below. If you use the WV-LUT method, please cite the original paper.
 
 ---
 
-## Improvements Over the Original
+## What we changed
 
-### 1. 🔧 Critical Bug Fix — Perceptual Loss Gradient
+| # | Change | File(s) | Effect |
+|---|--------|---------|--------|
+| 1 | **Perceptual-loss gradient fix.** The released code computed the prediction's VGG features inside `torch.no_grad()`, so the perceptual term contributed no gradient. Only the target branch is now detached. | `common/utils.py` | The VGG perceptual loss actually trains the model |
+| 2 | **Multi-domain objective.** Smooth-L1 + 0.04 VGG + 0.10 SSIM + 0.01 FFT-magnitude + 0.05 colour-constancy. | `common/utils.py`, `script/train.py`, `script/finetuneLUT.py` | Adds structure, frequency and colour terms |
+| 3 | **Eight-branch GAM** (`GAM_pll_8` instead of `GAM_pll_4`). | `common/GAM.py`, `common/architecture.py` | Slightly fewer parameters and FLOPs |
+| 4 | **Numerical safeguards.** Skip steps with NaN/Inf loss; clip the gradient norm to 1.0. | `script/train.py`, `script/finetuneLUT.py` | No diverged runs in 60k iterations |
+| 5 | **Faster LUT fine-tuning.** A custom autograd function (`_LUTGather`) with an `index_add_` backward replaces PyTorch's serialized indexing backward, and `torch.where` replaces boolean-mask assignment in simplex interpolation. | `common/finetune.py` | **8.8× faster** fine-tuning step at a fixed configuration |
 
-**File:** `common/utils.py`
-
-The original code wrapped **both** prediction and target VGG features inside `torch.no_grad()`, meaning zero gradients flowed back through the perceptual loss. The 0.04 perceptual weight was completely inactive.
+### The perceptual-loss fix
 
 ```python
-# Original (broken) — no gradients for pred
+# Released code: no gradient reaches the prediction
 with torch.no_grad():
-    pred_features = vgg(pred_norm)
+    pred_features   = vgg(pred_norm)
     target_features = vgg(target_norm)
 
-# Fixed — gradients flow through pred only
-pred_features = vgg(pred_norm)
+# Fixed
+pred_features = vgg(pred_norm)            # gradients flow to the model
 with torch.no_grad():
-    target_features = vgg(target_norm)
+    target_features = vgg(target_norm)    # target needs no gradient
 ```
 
-**Impact:** Restoring VGG gradient flow is the primary driver of faster convergence and better texture recovery.
+### The fine-tuning speedup
 
----
-
-### 2. 🧠 Multi-Domain Loss Function
-
-**Files:** `common/utils.py`, `script/train.py`, `script/finetuneLUT.py`
-
-Replaced the single-term pixel loss with a comprehensive multi-domain objective:
-
-```python
-loss = SmoothL1Loss(pred, gt)                    # pixel reconstruction
-     + 0.04 * VGGPerceptualLoss(pred, gt)         # perceptual features (now fixed)
-     + 0.10 * SSIMLoss(pred, gt)                  # structural similarity
-     + 0.01 * FFTFrequencyLoss(pred, gt)          # texture sharpness
-     + 0.05 * ColorConstancyLoss(pred)            # color balance
-```
-
-| Added Loss | Weight | Purpose |
-|---|---|---|
-| **SSIM Loss** | 0.10 | Directly optimizes luminance, contrast, structure |
-| **FFT Frequency Loss** | 0.01 | Preserves high-frequency texture and edge sharpness |
-| **Color Constancy Loss** | 0.05 | Prevents R/G/B channel imbalance in dark regions |
-
----
-
-### 3. ⚡ GAM Architecture Upgrade (pll-4 → pll-8)
-
-**File:** `common/GAM.py`
-
-Upgraded the Global Adjustment Module from 4 parallel QuerySABlock attention branches to **8 parallel branches**, doubling its capacity to predict per-image gamma correction and 3×3 color correction matrices.
-
-```bash
-# Original
---gam_type pll_4
-
-# Improved
---gam_type pll_8
-```
-
----
-
-### 4. 🛡️ Training Stability: NaN Guard + Gradient Clipping
-
-**Files:** `script/train.py`, `script/finetuneLUT.py`
-
-Added protection against silent NaN/Inf loss corruption and gradient explosion:
-
-```python
-if torch.isnan(loss_G) or torch.isinf(loss_G):
-    logger.warning(f"NaN/Inf loss detected at iter {i}! Skipping step.")
-    opt_G.zero_grad()
-    continue
-
-torch.nn.utils.clip_grad_norm_(params_G, max_norm=1.0)
-```
-
-**Result:** Zero training crashes across the full 60,000-iteration pipeline.
-
----
-
-### 5. 🚀 LUT Fine-Tuning Speedup (~10–100× faster)
-
-**File:** `common/finetune.py`
-
-**Profiling revealed two critical bottlenecks** in the original fine-tuning code:
-
-**Problem A — Serialized Gradient Write-Back (99.6% of GPU time):**
-Low-light images have most pixel values near zero, causing all gradient updates to pile up on the same few LUT entries. PyTorch's default `indexing_backward_kernel` processes these **sequentially**, spending 65.8 of 66.1 seconds per step in this single kernel.
-
-**Fix A — Atomic `index_add_` backward:**
 ```python
 class _LUTGather(torch.autograd.Function):
     @staticmethod
@@ -127,235 +56,152 @@ class _LUTGather(torch.autograd.Function):
         return gw, None
 ```
 
-**Problem B — 14,376 CPU↔GPU Synchronisations per Step:**
-Boolean mask assignments (`out[mask] = ...`) in the 24-case simplex interpolation force the CPU to wait for the GPU at every case. Each sync costs ~1.2 ms; 14,376 per step = ~17 seconds of stall overhead.
+In the 4D simplex interpolation, every `out[m] = f(x[m])` became
+`out = torch.where(m[:, None], f(x), out)`, which removes about 14,000 host–device synchronizations per step.
 
-**Fix B — Replace with `torch.where`** (bit-identical output, zero syncs):
-```python
-# Before (causes sync)
-out[i1] = (q - frac_a[i1]) * p0000[i1] + ...
-
-# After (no sync, identical result)
-out = torch.where(i1[:, None], (q - frac_a) * p0000 + ..., out)
-```
-
-**Step Time Comparison:**
-
-| Configuration | Time / Step | 10,000 Iterations |
+| Configuration (crop / batch) | Seconds per step | 10k iterations |
 |---|---|---|
-| Original code (cropSize 256, batch 2) | ~110 s | ~127 days ❌ |
-| cropSize 48, batch 8 (before fix) | ~4.4 s | ~12 hours |
-| **cropSize 48, batch 8 (after fix)** | **~0.5 s** | **~1.5 hours** ✅ |
+| Released code, 256 / 2 | ~110 | ~12.7 days |
+| Released code, 48 / 8 | ~4.4 | ~12.2 hours |
+| **Our code, 48 / 8** | **~0.5** | **~1.4 hours** |
+
+Measured on one NVIDIA A100 (40 GB).
+
+---
+
+## Results on LOL-v1 (15 test images)
+
+| Model | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
+|---|---|---|---|
+| WV-LUT network, reported (150k + 10k iterations) | 23.37 | 0.835 | 0.129 |
+| WV-LUT 4-bit LUT, reported | 23.31 | 0.833 | 0.129 |
+| **Ours, network (50k iterations)** | **23.06** | **0.820** | **0.182** |
+| **Ours, 4-bit LUT (10k fine-tuning iterations)** | **22.06** | **0.779** | **0.258** |
+
+"Reported" values are from Table IX of the original paper. Our network reaches 98.7% of the
+reported PSNR with 31% of the training iterations. Our deployed LUT is 1.25 dB below the reported
+WV-LUT. The paper analyses this gap: most of it comes from five test scenes and shows up as
+colour and hue errors.
+
+Metrics are computed per image at full resolution and averaged over the 15 test images.
+SSIM uses `skimage.metrics.structural_similarity` on RGB with default settings; LPIPS uses the
+AlexNet backbone. No GT-mean correction is applied.
 
 ---
 
 ## Requirements
 
-```
-python=3.8
-torch>=1.11
-```
+- Python 3.8
+- PyTorch 1.11.0, CUDA 11.3
 
-Install all dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
----
+## Data preparation
 
-## Data Preparation
-
-Download the dataset from [Google Drive](https://drive.google.com/drive/folders/1mvpUxO4D8iJSm0E75vqmPEq6YyF-bFsm) and arrange as follows:
+Download LOL-v1 and the evaluation sets from the
+[original authors' Google Drive folder](https://drive.google.com/drive/folders/1mvpUxO4D8iJSm0E75vqmPEq6YyF-bFsm)
+and arrange them as:
 
 ```
 data/
-├── LOL_v1/
-│   ├── high/        # Normal-light training images
-│   └── low/         # Low-light training images
-└── LowLightBenchmark/
-    └── LOL_v1_val/
-        ├── high/    # Normal-light validation images
-        └── low/     # Low-light validation images
+├── LOL_v1
+│   ├── high
+│   └── low
+└── LowLightBenchmark
+    └── LOL_v1_val
+        ├── high
+        └── low
 ```
-
-> **Note:** The dataset is excluded from this repository via `.gitignore`. Do not commit images or `.npy` cache files.
-
----
 
 ## Usage
 
-### Stage 1 — Train the Neural Network
+Run from inside `script/`. The settings below reproduce the results in our paper.
+
+**1. Train the network (50k iterations)**
 
 ```bash
-python script/train.py \
-  --model WVLUT \
-  --model_type shared \
-  --gam_type pll_8 \
-  --expDir ../models/WVLUT_shared \
-  --totalIter 50000 \
-  --batchSize 16 \
-  --cropSize 48 \
-  --trainDir ../data/LOL_v1 \
-  --valDataset LOL_v1_val \
-  --saveStep 10000 \
-  --valStep 5000 \
-  --displayStep 100
+cd script
+python train.py \
+  --batchSize 16 --cropSize 96 \
+  -e ../models/WVLUT_shared --model_type shared \
+  --totalIter 50000 --startIter 0 \
+  --lr0 1e-3 --lr1 1e-4 \
+  --displayStep 100 --valStep 500 --saveStep 2000 \
+  --trainDir ../data/LOL_v1 --valDataset LOL_v1_val
 ```
 
-### Stage 2 — Transfer Trained Weights to LUTs
+**2. Convert the network to 4-bit LUTs**
 
 ```bash
-python script/transferLUT.py \
-  --model WVLUT \
-  --model_type shared \
-  --gam_type pll_8 \
-  --interval 4 \
-  --nf 64 \
-  --loadIter 50000 \
-  --expDir ../models/WVLUT_shared
+python transferLUT.py \
+  --expDir ../models/WVLUT_shared --model_type shared \
+  --loadIter 50000 --nf 64
 ```
 
-### Stage 3 — Fine-Tune the LUTs
+**3. Fine-tune the LUTs (10k iterations, GAM frozen)**
 
 ```bash
-python script/finetuneLUT.py \
-  --batchSize 8 \
-  --cropSize 48 \
-  --expDir ../models/WVLUT_shared \
-  --model_type shared \
-  --gam_type pll_8 \
-  --interval 4 \
-  --nf 64 \
-  --workerNum 4 \
-  --startIter 50000 \
-  --totalIter 60000 \
-  --displayStep 100 \
-  --valStep 2000 \
-  --saveStep 2000 \
-  --trainDir ../data/LOL_v1 \
-  --valDataset LOL_v1_val
+python finetuneLUT.py \
+  --batchSize 8 --cropSize 96 \
+  --expDir ../models/WVLUT_shared --nf 64 \
+  --startIter 50000 --totalIter 60000 \
+  --lr0 1e-4 --lr1 1e-6 \
+  --displayStep 50 --valStep 200 --saveStep 1000 \
+  --trainDir ../data/LOL_v1 --valDataset LOL_v1_val
 ```
 
-### Stage 4 — Evaluate
+**4. Evaluate**
 
 ```bash
-# Evaluate the Neural Network model
-python script/eval.py \
+python eval.py \
+  --testDir ../data/LowLightBenchmark \
   --expDir ../models/WVLUT_shared \
-  --resultRoot ../eval/results_nn \
-  --model WVLUT \
-  --model_type shared \
-  --gam_type pll_8 \
-  --loadIter 50000 \
-  --valDataset LOL_v1_val \
-  --ifsave true
-
-# Evaluate the final LUT model
-python script/eval.py \
-  --expDir ../models/WVLUT_shared \
-  --resultRoot ../eval/results_lut \
-  --model LUT \
-  --model_type shared \
-  --gam_type pll_8 \
-  --interval 4 \
+  --resultRoot ../eval/results \
+  --model WVLUT --model_type shared --nf 64 \
   --loadIter 60000 \
   --valDataset LOL_v1_val \
-  --ifsave true
-```
-
-Or use the shell scripts for convenience:
-```bash
-sh script/train.sh
-sh script/transferLUT.sh
-sh script/finetuneLUT.sh
-sh script/eval.sh
+  --ifsave true --ifGT false
 ```
 
 ---
 
-## Per-Image Results (LOL-v1 Validation Set)
+## Citation
 
-### Our NN Model — Iter 50,000
-
-| Image | PSNR (dB) | SSIM | LPIPS |
-|---|:---:|:---:|:---:|
-| LOL_v1_val_1 | 19.89 | 0.857 | 0.152 |
-| LOL_v1_val_111 | 27.66 | 0.915 | 0.113 |
-| LOL_v1_val_146 | 21.50 | 0.862 | 0.175 |
-| LOL_v1_val_179 | 17.97 | 0.753 | 0.266 |
-| LOL_v1_val_22 | 21.22 | 0.834 | 0.217 |
-| LOL_v1_val_23 | 22.85 | 0.816 | 0.240 |
-| LOL_v1_val_493 | 19.81 | 0.594 | 0.243 |
-| LOL_v1_val_547 | 22.39 | 0.832 | 0.176 |
-| LOL_v1_val_55 | 22.99 | 0.849 | 0.186 |
-| LOL_v1_val_665 | 25.08 | 0.793 | 0.240 |
-| LOL_v1_val_669 | 24.97 | 0.868 | 0.162 |
-| LOL_v1_val_748 | 26.12 | 0.882 | 0.134 |
-| LOL_v1_val_778 | 22.13 | 0.774 | 0.202 |
-| LOL_v1_val_780 | 21.56 | 0.775 | 0.122 |
-| LOL_v1_val_79 | 25.09 | 0.909 | 0.097 |
-| **Average** | **23.06** | **0.820** | **0.182** |
-
-### Our LUT Model — Iter 60,000 (Fine-Tuned)
-
-| Image | PSNR (dB) | SSIM | LPIPS |
-|---|:---:|:---:|:---:|
-| LOL_v1_val_1 | 20.08 | 0.818 | 0.240 |
-| LOL_v1_val_111 | 27.05 | 0.871 | 0.191 |
-| LOL_v1_val_146 | 21.74 | 0.850 | 0.195 |
-| LOL_v1_val_179 | 17.58 | 0.722 | 0.316 |
-| LOL_v1_val_22 | 22.91 | 0.838 | 0.208 |
-| LOL_v1_val_23 | 22.00 | 0.758 | 0.300 |
-| LOL_v1_val_493 | 18.80 | 0.562 | 0.348 |
-| LOL_v1_val_547 | 23.80 | 0.832 | 0.203 |
-| LOL_v1_val_55 | 21.26 | 0.780 | 0.281 |
-| LOL_v1_val_665 | 20.38 | 0.722 | 0.359 |
-| LOL_v1_val_669 | 22.34 | 0.807 | 0.275 |
-| LOL_v1_val_748 | 23.51 | 0.837 | 0.254 |
-| LOL_v1_val_778 | 19.00 | 0.685 | 0.322 |
-| LOL_v1_val_780 | 20.99 | 0.714 | 0.257 |
-| LOL_v1_val_79 | 29.42 | 0.889 | 0.120 |
-| **Average** | **22.06** | **0.779** | **0.258** |
-
----
-
-## Repository Structure
-
-```
-WV-LUT/
-├── common/
-│   ├── architecture.py     # WVLUT neural network (training-time)
-│   ├── GAM.py              # Global Adjustment Module (pll_2 / pll_4 / pll_8)
-│   ├── finetune.py         # LUT-based inference model (deployment)
-│   ├── option.py           # Argument parsing (Train / Test)
-│   └── utils.py            # Loss functions & image quality metrics
-├── script/
-│   ├── data.py             # Dataset loaders
-│   ├── train.py            # Stage 1: Train the neural network
-│   ├── transferLUT.py      # Stage 2: Convert neural network → LUTs
-│   ├── finetuneLUT.py      # Stage 3: Fine-tune LUT entries end-to-end
-│   └── eval.py             # Evaluation script
-├── models/                 # Saved checkpoints and LUT .npy files
-├── data/                   # Datasets (excluded from git)
-├── eval/                   # Evaluation output images and logs
-├── requirements.txt
-└── README.md
-```
-
----
-
-## BibTeX
-
-If you use this work, please cite the original paper:
+If you use our fixes or results, please cite our paper:
 
 ```bibtex
-@ARTICLE{wvlut,
-  author={Li, Canlin and Su, Haowen and Tan, Xin and Zhang, Xiangfei and Ma, Lizhuang},
-  journal={IEEE Transactions on Multimedia},
-  title={WV-LUT: Wide Vision Lookup Tables for Real-Time Low-Light Image Enhancement},
-  year={2025},
-  doi={10.1109/TMM.2025.3535342}
+@misc{varshney2026reproducing,
+  author = {Varshney, Yukti and Takhi, Harkirat Singh},
+  title  = {Reproducing {WV-LUT}: A Perceptual-Loss Fix, a Multi-Domain Objective, and
+            Synchronization-Free {LUT} Fine-Tuning for Real-Time Low-Light Image Enhancement},
+  year   = {2026},
+  note   = {Manuscript}
 }
 ```
 
----
+and the original WV-LUT paper:
+
+```bibtex
+@article{wvlut,
+  author  = {Li, Canlin and Su, Haowen and Tan, Xin and Zhang, Xiangfei and Ma, Lizhuang},
+  journal = {IEEE Transactions on Multimedia},
+  title   = {{WV-LUT}: Wide Vision Lookup Tables for Real-Time Low-Light Image Enhancement},
+  year    = {2025},
+  volume  = {27},
+  pages   = {4441--4453},
+  doi     = {10.1109/TMM.2025.3535342}
+}
+```
+
+## Acknowledgements
+
+This code builds on the [official WV-LUT implementation](https://github.com/ssw219/WV-LUT),
+which in turn builds on [MuLUT](https://github.com/ddlee-cn/MuLUT) and the
+[Illumination-Adaptive Transformer](https://github.com/cuiziteng/Illumination-Adaptive-Transformer).
+We thank all of their authors for releasing their code.
+
+## Contact
+
+Yukti Varshney: yukti.varshney.ug24@nsut.ac.in
